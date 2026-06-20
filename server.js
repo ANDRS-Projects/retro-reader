@@ -303,7 +303,19 @@ async function fetchOgImage(link) {
       req.on('timeout', () => req.destroy(new Error('timeout')));
     });
     const m = html.match(/<meta[^>]+property=["']og:image["'][^>]*>/i) || html.match(/<meta[^>]+name=["']og:image["'][^>]*>/i);
-    const image = m ? attr(m[0], 'content') : '';
+    const raw = m ? attr(m[0], 'content') : '';
+    // Some pages publish a relative og:image URL (e.g. "/images/x.png").
+    // Resolve it against the article's own URL so the frontend always gets
+    // an absolute URL — otherwise it would try to load it relative to the
+    // reader app's own origin instead of the source site's.
+    let image = '';
+    if (raw) {
+      try {
+        image = new URL(raw, link).toString();
+      } catch {
+        image = '';
+      }
+    }
     ogImageCache.set(link, image);
     return image;
   } catch (e) {
@@ -341,7 +353,12 @@ async function getFeedItems(feed) {
       feedUrl: feed.url,
       isNew: !seen.has(it.link),
     }));
-    if (feed.group === 'Tech' || feed.group === 'News' || feed.group === 'Design' || feed.group === 'Substack') {
+    // Skip og:image backfill only for Reddit — its linked pages rarely have a
+    // usable og:image and scraping dozens of them would add load on top of
+    // Reddit's already-tight rate limit. Every other feed gets backfill
+    // regardless of category, so a blog/Substack-style feed in any group
+    // (not just a fixed allowlist) still gets its images.
+    if (!feed.url.includes('reddit.com')) {
       await fillMissingImages(items);
     }
     feedCache.set(feed.url, { items, fetchedAt: Date.now() });
