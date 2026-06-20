@@ -1,10 +1,15 @@
 # Retro Reader
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-FFDD00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/dare2create)
+
 A retro, TV-themed RSS/Atom feed reader you run locally — aggregate news sites, Substack
 newsletters, and any RSS/Atom feed into one dashboard. Built as a vanilla Node.js app
 (built-in `http`/`https` modules only, zero npm dependencies) with no build step and no
 database, running entirely locally as a single process serving a static page and a small
 JSON-file-backed API.
+
+If you find this useful, you can [buy me a coffee](https://buymeacoffee.com/dare2create) —
+appreciated, never expected.
 
 ## Features
 
@@ -29,7 +34,7 @@ JSON-file-backed API.
 ## Quick Start
 
 ```bash
-git clone https://github.com/carolinevrauwdeunt-lab/retro-reader.git
+git clone https://github.com/ANDRS-Projects/retro-reader.git
 cd retro-reader
 ./setup.sh
 node server.js
