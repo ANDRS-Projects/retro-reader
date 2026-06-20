@@ -626,6 +626,101 @@
     100% { box-shadow: 0 0 0 0 rgba(201, 146, 58, 0); }
   }
   .loading-text { transition: opacity 0.25s ease; }
+
+  /* ── ARTICLE READER PEEK PANEL ── */
+  .reader-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 60;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+  }
+  .reader-backdrop.open { opacity: 1; }
+
+  .reader-panel {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(680px, 92vw);
+    background: var(--panel);
+    border-left: 1px solid rgba(255,255,255,0.08);
+    box-shadow: -24px 0 60px rgba(0,0,0,0.5);
+    z-index: 61;
+    display: flex; flex-direction: column;
+    transform: translateX(100%);
+    transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .reader-panel.open { transform: translateX(0); }
+
+  .reader-header {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 14px;
+    padding: 22px 24px 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .reader-header-meta {
+    font-size: 11px; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--gold);
+    margin-bottom: 8px;
+  }
+  .reader-header-title {
+    font-size: 19px; font-weight: 700;
+    line-height: 1.35;
+    color: var(--text);
+  }
+  .reader-close {
+    background: none; border: none; cursor: pointer;
+    color: var(--text-dim); font-size: 22px;
+    line-height: 1; padding: 4px;
+    flex-shrink: 0;
+  }
+  .reader-close:hover { color: var(--text); }
+
+  .reader-body {
+    flex: 1; overflow-y: auto;
+    padding: 20px 24px 32px;
+    font-size: 15px; line-height: 1.7;
+    color: var(--text);
+  }
+  .reader-body img { max-width: 100%; border-radius: 8px; margin: 10px 0; }
+  .reader-body a { color: var(--gold-bright); }
+  .reader-body p, .reader-body ul, .reader-body ol, .reader-body blockquote { margin: 0 0 14px; }
+  .reader-body h1, .reader-body h2, .reader-body h3 { color: var(--text); margin: 20px 0 10px; line-height: 1.3; }
+  .reader-body blockquote {
+    border-left: 2px solid var(--gold);
+    padding-left: 14px;
+    color: var(--text-dim);
+  }
+  .reader-body pre, .reader-body code {
+    background: rgba(255,255,255,0.05);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  .reader-body pre { padding: 12px; overflow-x: auto; }
+  .reader-body code { padding: 2px 5px; }
+
+  .reader-teaser-note {
+    font-size: 12.5px; color: var(--text-dim);
+    margin-top: 8px; padding-top: 16px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .reader-footer {
+    padding: 14px 24px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+  .reader-original-link {
+    display: inline-block;
+    font-size: 12px; font-weight: 700;
+    letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--gold);
+    text-decoration: none;
+  }
+  .reader-original-link:hover { color: var(--gold-bright); }
+
+  @media (max-width: 700px) {
+    .reader-panel { width: 100vw; }
+  }
 </style>
 </head>
 <body>
@@ -645,6 +740,7 @@
 <div id="presetOverlay"></div>
 <div id="addFeedOverlay"></div>
 <div id="newCategoryOverlay"></div>
+<div id="readerOverlay"></div>
 
 <div class="main">
   <div class="topbar">
@@ -1242,25 +1338,77 @@
     return setInterval(render, 2200);
   }
 
+  let awaitingReddit = false;
+  let loadGeneration = 0;
+
+  function stalenessNote(oldestFetchedAt) {
+    const staleness = oldestFetchedAt ? timeAgo(oldestFetchedAt) : '';
+    return staleness && staleness !== 'just now' ? ` · checked as of ${staleness}` : '';
+  }
+
+  function updatePageSub(extra) {
+    const newCount = items.filter(it => it.isNew).length;
+    document.getElementById('pageSub').textContent = items.length
+      ? `${items.length} posts · ${newCount} new${extra}`
+      : (awaitingReddit ? 'Loading…' : 'No posts found');
+  }
+
   async function loadItems(spin) {
+    const myGeneration = ++loadGeneration;
     const badge = document.getElementById('badge');
     if (spin) badge.classList.add('spinning');
     const loadingTimer = startLoadingAnimation();
     const qs = currentGroup ? ('?group=' + encodeURIComponent(currentGroup)) : '';
     try {
-      items = await fetch('/api/items' + qs).then(r => r.json());
+      const data = await fetch('/api/items' + qs).then(r => r.json());
+      if (myGeneration !== loadGeneration) return; // a newer load superseded this one
+      items = data.items || [];
+      awaitingReddit = !!data.hasRedditFeeds;
       clearInterval(loadingTimer);
       renderArticles();
       renderTvWall();
       renderFeedList();
-      const newCount = items.filter(it => it.isNew).length;
-      document.getElementById('pageSub').textContent =
-        items.length ? `${items.length} posts · ${newCount} new` : 'No posts found';
+      // RSS is pull, not push — we only know what we last pulled. Some feeds
+      // (especially Reddit, which gets cached for up to 20min to dodge its
+      // rate limit) may be older than "now" even right after a refresh, so
+      // say so honestly instead of implying everything's live.
+      updatePageSub(stalenessNote(data.oldestFetchedAt) + (awaitingReddit ? ' · loading Reddit feeds…' : ''));
+
+      if (!awaitingReddit) {
+        badge.classList.remove('spinning');
+        return;
+      }
+
+      // Reddit is fetched separately and merged in once it arrives, instead
+      // of blocking the whole view on its slow, rate-limited sequential
+      // fetch — see /api/items/reddit on the server.
+      const fastOldest = data.oldestFetchedAt;
+      fetch('/api/items/reddit' + qs).then(r => r.json()).then((redditData) => {
+        if (myGeneration !== loadGeneration) return; // group changed while Reddit was loading
+        awaitingReddit = false;
+        const merged = items.concat(redditData.items || []);
+        merged.sort((a, b) => new Date(b.published || 0) - new Date(a.published || 0));
+        items = merged;
+        renderArticles();
+        renderTvWall();
+        renderFeedList();
+        const oldestPair = [fastOldest, redditData.oldestFetchedAt].filter((v) => v != null);
+        const combinedOldest = oldestPair.length ? Math.min(...oldestPair) : null;
+        updatePageSub(stalenessNote(combinedOldest));
+      }).catch(() => {
+        // Reddit fetch failed outright — leave the fast items showing as-is.
+      }).finally(() => {
+        if (myGeneration === loadGeneration) {
+          awaitingReddit = false;
+          badge.classList.remove('spinning');
+        }
+      });
     } catch {
+      if (myGeneration !== loadGeneration) return;
+      awaitingReddit = false;
       clearInterval(loadingTimer);
       document.getElementById('pageSub').textContent = 'Could not load feeds';
       document.getElementById('articles').innerHTML = '<div class="empty-state">Could not load feeds — click Refresh.</div>';
-    } finally {
       badge.classList.remove('spinning');
     }
   }
@@ -1278,7 +1426,7 @@
     if (currentView !== 'tv') return;
     const wall = document.getElementById('tvWall');
     if (!items.length) {
-      wall.innerHTML = '<div class="empty-state">No posts yet — click Refresh.</div>';
+      wall.innerHTML = awaitingReddit ? loadingStateHtml() : '<div class="empty-state">No posts yet — click Refresh.</div>';
       return;
     }
     wall.innerHTML = items.map((it, i) => {
@@ -1337,7 +1485,7 @@
   function renderArticles() {
     const el = document.getElementById('articles');
     if (!items.length) {
-      el.innerHTML = '<div class="empty-state">No posts yet — click Refresh.</div>';
+      el.innerHTML = awaitingReddit ? loadingStateHtml() : '<div class="empty-state">No posts yet — click Refresh.</div>';
       return;
     }
     el.innerHTML = items.map((it, i) => `
@@ -1357,6 +1505,8 @@
     return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  let readerState = null; // { item, content, error, loading }
+
   async function openArticle(i) {
     const it = items[i];
     if (!it.link) return;
@@ -1370,7 +1520,94 @@
     it.isNew = false;
     renderArticles();
     renderTvWall();
-    window.open(it.link, '_blank');
+
+    readerState = { item: it, content: '', error: '', loading: true };
+    renderReaderShell();
+    requestAnimationFrame(() => {
+      document.querySelector('.reader-backdrop')?.classList.add('open');
+      document.querySelector('.reader-panel')?.classList.add('open');
+    });
+
+    try {
+      const qs = '?feedUrl=' + encodeURIComponent(it.feedUrl || '') + '&link=' + encodeURIComponent(it.link);
+      const res = await fetch('/api/article-content' + qs);
+      const data = await res.json();
+      if (!readerState || readerState.item !== it) return; // panel closed/changed while fetching
+      if (data.ok) {
+        readerState = { item: it, content: data.content || '', error: '', loading: false };
+      } else {
+        readerState = { item: it, content: '', error: data.error || 'Could not load this article', loading: false };
+      }
+    } catch {
+      if (readerState && readerState.item === it) {
+        readerState = { item: it, content: '', error: 'Could not reach the server', loading: false };
+      }
+    }
+    renderReaderBody(); // body content only — leaves the open panel/backdrop untouched
+  }
+
+  function closeReaderPanel() {
+    document.querySelector('.reader-backdrop')?.classList.remove('open');
+    document.querySelector('.reader-panel')?.classList.remove('open');
+    readerState = null;
+    setTimeout(() => {
+      const overlay = document.getElementById('readerOverlay');
+      if (overlay && !readerState) overlay.innerHTML = '';
+    }, 280);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && readerState) closeReaderPanel();
+  });
+
+  // Builds the backdrop/panel/header/footer shell once per open — this is
+  // the element that gets the .open class added for the slide-in transition.
+  // Must NOT be called again while the panel is already open (use
+  // renderReaderBody() instead), or the freshly-recreated elements reset to
+  // their closed state and the panel silently snaps shut mid-transition.
+  function renderReaderShell() {
+    const overlay = document.getElementById('readerOverlay');
+    if (!readerState) { overlay.innerHTML = ''; return; }
+    const { item } = readerState;
+    overlay.innerHTML = `
+      <div class="reader-backdrop" onclick="closeReaderPanel()"></div>
+      <div class="reader-panel">
+        <div class="reader-header">
+          <div>
+            <div class="reader-header-meta">${escapeHtml(item.feedName || '')}</div>
+            <div class="reader-header-title">${escapeHtml(item.title || '')}</div>
+          </div>
+          <button class="reader-close" onclick="closeReaderPanel()">&times;</button>
+        </div>
+        <div class="reader-body" id="readerBody"></div>
+        <div class="reader-footer">
+          <a class="reader-original-link" href="${escapeHtml(item.link)}" target="_blank" rel="noopener noreferrer">Open original ↗</a>
+        </div>
+      </div>`;
+    renderReaderBody();
+  }
+
+  function htmlTextLength(html) {
+    const div = document.createElement('div');
+    div.innerHTML = html || '';
+    return (div.textContent || '').trim().length;
+  }
+
+  function renderReaderBody() {
+    const body = document.getElementById('readerBody');
+    if (!body || !readerState) return;
+    const { item, content, error, loading } = readerState;
+    // Compare actual visible text, not raw HTML length — a single wrapped
+    // <a> tag (e.g. Hacker News' feed, which is just a "Comments" link) can
+    // out-byte the plain-text summary without containing any real content.
+    const hasRealContent = content && htmlTextLength(content) > (item.summary || '').length + 20;
+
+    body.innerHTML = `
+      ${loading ? `<div class="loading-state"><div class="loading-pulse"></div><div class="loading-text">Tuning in…</div></div>` : ''}
+      ${!loading && error ? `<p>${escapeHtml(item.summary || '')}</p><div class="reader-teaser-note">${escapeHtml(error)}</div>` : ''}
+      ${!loading && !error ? content : ''}
+      ${!loading && !error && !hasRealContent ? `<div class="reader-teaser-note">This feed only publishes a short summary — there's no more article text to show in-app.</div>` : ''}
+    `;
   }
 
   function selectGroup(group) {

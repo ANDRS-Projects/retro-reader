@@ -108,7 +108,7 @@ function fetchUrl(target) {
   return new Promise((resolve, reject) => {
     const client = target.startsWith('http://') ? http : https;
     const req = client.get(target, {
-      headers: { 'User-Agent': 'retro-reader/1.0 (+https://github.com/carolinevrauwdeunt-lab/retro-reader)' },
+      headers: { 'User-Agent': 'retro-reader/1.0 (+https://github.com/ANDRS-Projects/retro-reader)' },
       timeout: 10000,
     }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
@@ -155,6 +155,58 @@ function stripTags(str) {
 function attr(tag, name) {
   const m = tag.match(new RegExp(name + '=["\']([^"\']*)["\']'));
   return m ? decodeEntities(m[1]) : '';
+}
+
+// Allowlist HTML sanitizer for rendering third-party feed content in the
+// in-app article reader. Rebuilds every surviving tag from scratch with only
+// known-safe attributes rather than trying to blacklist dangerous ones, so
+// nothing we didn't explicitly handle (event handlers, javascript: URLs,
+// style-based attacks, etc.) can pass through.
+const READER_ALLOWED_TAGS = new Set([
+  'p', 'br', 'b', 'strong', 'i', 'em', 'u', 'blockquote',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li',
+  'a', 'img', 'figure', 'figcaption', 'pre', 'code', 'span', 'div', 'hr',
+]);
+
+function sanitizeHtml(rawHtml) {
+  let html = decodeEntities(unwrapCdata(rawHtml));
+
+  // Remove dangerous elements entirely, including their content.
+  html = html.replace(
+    /<(script|style|iframe|object|embed|noscript|form|applet|audio|video|link|meta|base)[^>]*>[\s\S]*?<\/\1>/gi,
+    ''
+  );
+  html = html.replace(/<(meta|base|embed|link|source|track)[^>]*\/?>/gi, '');
+
+  // Defense in depth in case any slipped past the element strip above.
+  html = html.replace(/\son\w+\s*=\s*"[^"]*"/gi, '').replace(/\son\w+\s*=\s*'[^']*'/gi, '');
+  html = html.replace(/javascript:/gi, '');
+
+  // Rebuild every remaining tag from an allowlist with only safe attributes —
+  // anything not explicitly handled here is dropped, not merely "cleaned".
+  html = html.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)([^>]*)>/g, (full, tagName) => {
+    const tag = tagName.toLowerCase();
+    if (!READER_ALLOWED_TAGS.has(tag)) return '';
+    if (full.startsWith('</')) return `</${tag}>`;
+    if (tag === 'a') {
+      const href = attr(full, 'href');
+      if (href && /^https?:\/\//i.test(href)) {
+        return `<a href="${href.replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer nofollow">`;
+      }
+      return '<a>';
+    }
+    if (tag === 'img') {
+      const src = attr(full, 'src');
+      const alt = attr(full, 'alt');
+      if (src && /^https?:\/\//i.test(src)) {
+        return `<img src="${src.replace(/"/g, '&quot;')}" alt="${alt.replace(/"/g, '&quot;')}" loading="lazy">`;
+      }
+      return '';
+    }
+    return `<${tag}>`;
+  });
+
+  return html.trim();
 }
 
 function extractImage(block, summaryRaw) {
@@ -207,6 +259,13 @@ function parseFeed(xml) {
       author: stripTags(author),
       summary: stripTags(summaryRaw).slice(0, 280),
       image: image.trim(),
+      // Full sanitized content for the in-app reader panel — not truncated
+      // like `summary`, since feeds that publish full-text content (many
+      // Substack/blog feeds) should be readable in-app without leaving the
+      // app. Feeds that only ever provide a short teaser (BBC, NYT, etc.)
+      // will simply have content no longer than summary — that's the real
+      // length the publisher provides, not a limitation of this app.
+      content: sanitizeHtml(summaryRaw.slice(0, 200000)),
     });
   }
   return items;
@@ -218,7 +277,7 @@ async function fetchOgImage(link) {
     const client = link.startsWith('http://') ? http : https;
     const html = await new Promise((resolve, reject) => {
       const req = client.get(link, {
-        headers: { 'User-Agent': 'retro-reader/1.0 (+https://github.com/carolinevrauwdeunt-lab/retro-reader)' },
+        headers: { 'User-Agent': 'retro-reader/1.0 (+https://github.com/ANDRS-Projects/retro-reader)' },
         timeout: OG_IMAGE_TIMEOUT_MS,
       }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
@@ -279,6 +338,7 @@ async function getFeedItems(feed) {
       ...it,
       feedName: feed.name,
       feedGroup: feed.group,
+      feedUrl: feed.url,
       isNew: !seen.has(it.link),
     }));
     if (feed.group === 'Tech' || feed.group === 'News' || feed.group === 'Design' || feed.group === 'Substack') {
@@ -343,25 +403,57 @@ async function validateFeedUrl(feedUrl) {
 
 const REDDIT_FETCH_GAP_MS = 3000;
 
-async function getAllItems(groupFilter) {
-  const feeds = loadFeeds().filter((f) => !groupFilter || f.group === groupFilter);
-  const redditFeeds = feeds.filter((f) => f.url.includes('reddit.com'));
-  const otherFeeds = feeds.filter((f) => !f.url.includes('reddit.com'));
+// Surfaces how stale a response could be: the oldest fetchedAt among the
+// given feeds. A feed with no cache entry yet (first-ever fetch, or a hard
+// failure with nothing cached) doesn't count as "stale" — there's simply no
+// prior fetch time to report for it.
+function oldestFetchedAtForFeeds(feeds) {
+  let oldest = null;
+  for (const feed of feeds) {
+    const cached = feedCache.get(feed.url);
+    if (cached && (oldest === null || cached.fetchedAt < oldest)) {
+      oldest = cached.fetchedAt;
+    }
+  }
+  return oldest;
+}
+
+async function fetchFeedsConcurrently(feeds) {
   const results = [];
-  const FETCH_CONCURRENCY = 4;
-  for (let i = 0; i < otherFeeds.length; i += FETCH_CONCURRENCY) {
-    const batch = otherFeeds.slice(i, i + FETCH_CONCURRENCY);
+  const CONCURRENCY = 4;
+  for (let i = 0; i < feeds.length; i += CONCURRENCY) {
+    const batch = feeds.slice(i, i + CONCURRENCY);
     results.push(...(await Promise.all(batch.map(getFeedItems))));
   }
-  // Reddit rate-limits aggressively (429s) when hit with several requests at once,
-  // so its feeds are fetched one at a time with a gap instead of in concurrent batches.
+  return results.flat();
+}
+
+// Non-Reddit feeds only — fast, fetched concurrently. Kept separate from
+// Reddit so the UI can render this immediately instead of blocking on
+// Reddit's slow, rate-limited sequential fetch below.
+async function getFastItems(groupFilter) {
+  const feeds = loadFeeds().filter((f) => !groupFilter || f.group === groupFilter);
+  const otherFeeds = feeds.filter((f) => !f.url.includes('reddit.com'));
+  const hasRedditFeeds = feeds.some((f) => f.url.includes('reddit.com'));
+  const items = await fetchFeedsConcurrently(otherFeeds);
+  items.sort((a, b) => new Date(b.published || 0) - new Date(a.published || 0));
+  return { items, oldestFetchedAt: oldestFetchedAtForFeeds(otherFeeds), hasRedditFeeds };
+}
+
+// Reddit rate-limits aggressively (429s) when hit with several requests at
+// once, so its feeds are fetched one at a time with a gap instead of in
+// concurrent batches — this is what makes Reddit slow, hence the split above.
+async function getRedditItems(groupFilter) {
+  const feeds = loadFeeds().filter((f) => !groupFilter || f.group === groupFilter);
+  const redditFeeds = feeds.filter((f) => f.url.includes('reddit.com'));
+  const results = [];
   for (let i = 0; i < redditFeeds.length; i++) {
     results.push(await getFeedItems(redditFeeds[i]));
     if (i < redditFeeds.length - 1) await new Promise((r) => setTimeout(r, REDDIT_FETCH_GAP_MS));
   }
-  const all = results.flat();
-  all.sort((a, b) => new Date(b.published || 0) - new Date(a.published || 0));
-  return all;
+  const items = results.flat();
+  items.sort((a, b) => new Date(b.published || 0) - new Date(a.published || 0));
+  return { items, oldestFetchedAt: oldestFetchedAtForFeeds(redditFeeds) };
 }
 
 const HTML_PATH = path.join(__dirname, 'index.html');
@@ -542,9 +634,48 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === '/api/items') {
-    const items = await getAllItems(query.group);
+    const { items, oldestFetchedAt, hasRedditFeeds } = await getFastItems(query.group);
+    // Strip the full sanitized `content` field from the listing response —
+    // it can be tens of KB per item (full-text blog/Substack feeds), which
+    // would bloat "All feeds" payloads for content nobody's opened yet. The
+    // in-app reader fetches it on demand via /api/article-content instead.
+    const trimmed = items.map(({ content, ...rest }) => rest);
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(items));
+    res.end(JSON.stringify({ items: trimmed, oldestFetchedAt, hasRedditFeeds }));
+    return;
+  }
+
+  if (pathname === '/api/items/reddit') {
+    const { items, oldestFetchedAt } = await getRedditItems(query.group);
+    const trimmed = items.map(({ content, ...rest }) => rest);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ items: trimmed, oldestFetchedAt }));
+    return;
+  }
+
+  if (pathname === '/api/article-content') {
+    const feedUrl = query.feedUrl;
+    const link = query.link;
+    if (!feedUrl || !link) {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ ok: false, error: 'Missing feedUrl or link' }));
+      return;
+    }
+    const feed = loadFeeds().find((f) => f.url === feedUrl);
+    if (!feed) {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ ok: false, error: 'Feed not found' }));
+      return;
+    }
+    const items = await getFeedItems(feed);
+    const item = items.find((it) => it.link === link);
+    if (!item) {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ ok: false, error: 'Article not found' }));
+      return;
+    }
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true, title: item.title, content: item.content, image: item.image, link: item.link }));
     return;
   }
 
