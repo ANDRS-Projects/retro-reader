@@ -1228,7 +1228,8 @@
           <div class="add-feed-body">
             <div class="add-feed-field">
               <div class="add-feed-label">Feed URL${!bulk ? '' : 's'} <span style="opacity:.6">(paste one or multiple, one per line)</span></div>
-              <textarea id="addFeedUrl" class="add-feed-input" rows="3" placeholder="https://example.com/feed&#10;https://someone.substack.com">${check && check.url ? escapeHtml(check.url) : ''}</textarea>
+              <textarea id="addFeedUrl" class="add-feed-input" rows="3" placeholder="https://example.com/feed&#10;https://someone.substack.com&#10;https://www.reddit.com/r/SubredditName/new.rss">${check && check.url ? escapeHtml(check.url) : ''}</textarea>
+              <div style="font-size:11px; opacity:.6; margin-top:2px;">Reddit: append <code>/new.rss</code> (newest), <code>/hot.rss</code>, <code>/top.rss</code>, or just <code>.rss</code> to a subreddit/user URL</div>
             </div>
             ${check && check.checking ? `<div class="add-feed-status">Checking feed…</div>` : ''}
             ${check && !check.checking && check.ok === false ? `<div class="add-feed-status err">${escapeHtml(check.error || 'Could not load this feed')}</div>` : ''}
